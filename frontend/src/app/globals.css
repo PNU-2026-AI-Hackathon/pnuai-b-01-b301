@@ -1,27 +1,37 @@
+@import url("https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/variable/pretendardvariable-dynamic-subset.min.css");
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+  --background: #f6f5ee;
+  --foreground: #1a1f1b;
 }
 
 body {
   color: var(--foreground);
   background: var(--background);
-  font-family: Arial, Helvetica, sans-serif;
+  font-family: "Pretendard Variable", Pretendard, -apple-system,
+    BlinkMacSystemFont, system-ui, Roboto, "Helvetica Neue", "Segoe UI",
+    "Apple SD Gothic Neo", "Noto Sans KR", sans-serif;
+  letter-spacing: -0.01em;
 }
 
 @layer utilities {
   .text-balance {
     text-wrap: balance;
+  }
+  /* 시안 배경의 은은한 식물 텍스처 느낌을 그라디언트로 재현 */
+  .bg-farm-hero {
+    background:
+      radial-gradient(1200px 500px at 85% -10%, rgba(47, 125, 75, 0.1), transparent 60%),
+      radial-gradient(900px 420px at -10% 110%, rgba(47, 125, 75, 0.12), transparent 55%),
+      #f6f5ee;
+  }
+  .bg-farm-section {
+    background:
+      radial-gradient(800px 360px at 100% 0%, rgba(47, 125, 75, 0.07), transparent 60%),
+      #f6f5ee;
   }
 }

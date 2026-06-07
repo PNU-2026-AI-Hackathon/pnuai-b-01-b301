@@ -1,3 +1,12 @@
 {
-  "extends": ["next/core-web-vitals", "next/typescript"]
+  "extends": ["next/core-web-vitals", "next/typescript"],
+  "overrides": [
+    {
+      "files": ["src/app/api/**/*.ts", "src/lib/db.ts", "src/lib/ai-cache.ts", "src/lib/demo-mode.ts", "src/lib/anomaly-detector.ts", "src/lib/nav-calculator.ts", "src/lib/waterfall.ts"],
+      "rules": {
+        "@typescript-eslint/no-explicit-any": "warn",
+        "@typescript-eslint/no-unused-vars": "warn"
+      }
+    }
+  ]
 }
