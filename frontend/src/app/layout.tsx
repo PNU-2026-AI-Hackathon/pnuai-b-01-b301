@@ -1,12 +1,11 @@
 import type { Metadata } from "next";
 import "./globals.css";
-import Header from "@/components/Header";
-import Footer from "@/components/Footer";
+import { Footer, Header } from "@/components/FarmFi";
 
 export const metadata: Metadata = {
-  title: "FarmFi — 공실을 미니팜으로, 자금 집행은 코드로",
+  title: "FarmFi | 도심 유휴공간 스마트팜 플랫폼",
   description:
-    "도심 유휴공간 스마트팜 STO 플랫폼. 마일스톤 기반 에스크로로 청약금을 보호하고, AI 검증으로 단계별 자금 집행을 투명하게 공개합니다.",
+    "도심 유휴공간, 운영 파트너, 투자자, 소비자를 연결하는 스마트팜 플랫폼 FarmFi.",
 };
 
 export default function RootLayout({
@@ -16,9 +15,9 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="ko">
-      <body className="antialiased">
+      <body>
         <Header />
-        <main className="min-h-screen">{children}</main>
+        {children}
         <Footer />
       </body>
     </html>
