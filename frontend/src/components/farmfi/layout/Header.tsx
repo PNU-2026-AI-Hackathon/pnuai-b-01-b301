@@ -1,0 +1,253 @@
+"use client";
+
+import { useState } from "react";
+import Link from "next/link";
+import Image from "next/image";
+import { ConnectButton } from "@rainbow-me/rainbowkit";
+import { useAuth } from "@/lib/useAuth";
+import { shortenHash } from "@/lib/format";
+
+const nav = [
+  ["서비스 소개", "/"],
+  ["프로젝트", "/projects"],
+  ["공간 등록", "/space"],
+  ["운영자 지원", "/operator"],
+  ["투명성", "/transparency"],
+  ["마켓", "/market"],
+  ["문의하기", "#contact"],
+];
+
+export function Header() {
+  const { user, isAuthenticated, isLoading, logout } = useAuth();
+  const [authError, setAuthError] = useState<string | null>(null);
+  const [isMobileOpen, setIsMobileOpen] = useState(false);
+
+  const closeMobile = () => setIsMobileOpen(false);
+
+  const handleLogout = async () => {
+    setAuthError(null);
+    try {
+      await logout();
+    } catch (err) {
+      setAuthError(
+        err instanceof Error ? err.message : "로그아웃에 실패했습니다.",
+      );
+    }
+  };
+
+  // 세션 상태 기반 계정 메뉴 라벨 (이름 우선, 없으면 지갑 주소 축약).
+  const accountLabel =
+    user?.name ??
+    (user?.walletAddress ? shortenHash(user.walletAddress) : "내 정보");
+
+  // 로그인/회원가입 vs 내 정보/로그아웃 — 데스크톱·모바일 공통 렌더.
+  const renderAuthNav = (onNavigate?: () => void) => {
+    if (isLoading) return null;
+    if (isAuthenticated) {
+      return (
+        <>
+          <Link className="ghost" href="/mypage" onClick={onNavigate}>
+            {accountLabel}
+          </Link>
+          <button
+            className="ghost"
+            type="button"
+            onClick={() => {
+              handleLogout();
+              onNavigate?.();
+            }}
+          >
+            로그아웃
+          </button>
+        </>
+      );
+    }
+    return (
+      <>
+        <Link className="ghost" href="/login" onClick={onNavigate}>
+          로그인
+        </Link>
+        <Link className="btn" href="/signup" onClick={onNavigate}>
+          회원가입
+        </Link>
+      </>
+    );
+  };
+
+  return (
+    <header className="nav">
+      <div className="shell">
+        <div className="nav-inner">
+          <Link className="logo" href="/" aria-label="FarmFi 홈">
+            <Image
+              src="/assets/farmfi-logo.png"
+              alt="FarmFi"
+              width={154}
+              height={41}
+              className="logo-img"
+              priority
+            />
+          </Link>
+          <nav className="nav-links" aria-label="주요 메뉴">
+            {nav.map(([label, href]) => (
+              <Link href={href} key={label}>
+                {label}
+              </Link>
+            ))}
+          </nav>
+          <div className="nav-actions">
+            {authError && (
+              <span className="muted" role="alert">
+                {authError}
+              </span>
+            )}
+            {renderAuthNav()}
+            <ConnectButton.Custom>
+              {({
+                account,
+                chain,
+                openConnectModal,
+                openAccountModal,
+                openChainModal,
+                mounted,
+              }) => {
+                const ready = mounted;
+                const connected = ready && account && chain;
+
+                if (!ready) {
+                  return (
+                    <button className="btn" type="button" disabled aria-hidden>
+                      지갑 연결
+                    </button>
+                  );
+                }
+
+                if (!connected) {
+                  return (
+                    <button
+                      className="btn"
+                      type="button"
+                      onClick={openConnectModal}
+                    >
+                      지갑 연결
+                    </button>
+                  );
+                }
+
+                if (chain.unsupported) {
+                  return (
+                    <button
+                      className="ghost"
+                      type="button"
+                      onClick={openChainModal}
+                    >
+                      네트워크 전환
+                    </button>
+                  );
+                }
+
+                return (
+                  <button
+                    className="ghost"
+                    type="button"
+                    onClick={openAccountModal}
+                  >
+                    {shortenHash(account.address)}
+                  </button>
+                );
+              }}
+            </ConnectButton.Custom>
+          </div>
+
+          {/* Hamburger — visible only below 980px via CSS */}
+          <button
+            className="nav-hamburger"
+            type="button"
+            aria-label={isMobileOpen ? "메뉴 닫기" : "메뉴 열기"}
+            aria-expanded={isMobileOpen}
+            onClick={() => setIsMobileOpen((v) => !v)}
+          >
+            <span />
+            <span />
+            <span />
+          </button>
+        </div>
+
+        {/* Mobile drawer */}
+        {isMobileOpen && (
+          <nav className="nav-mobile-menu" aria-label="모바일 메뉴">
+            {nav.map(([label, href]) => (
+              <Link href={href} key={label} onClick={closeMobile}>
+                {label}
+              </Link>
+            ))}
+            <div className="nav-mobile-actions">
+              {authError && (
+                <span className="muted" role="alert">
+                  {authError}
+                </span>
+              )}
+              {renderAuthNav(closeMobile)}
+              <ConnectButton.Custom>
+                {({
+                  account,
+                  chain,
+                  openConnectModal,
+                  openAccountModal,
+                  openChainModal,
+                  mounted,
+                }) => {
+                  if (!mounted) return null;
+                  const connected = account && chain;
+
+                  if (!connected) {
+                    return (
+                      <button
+                        className="btn"
+                        type="button"
+                        onClick={() => {
+                          openConnectModal();
+                          closeMobile();
+                        }}
+                      >
+                        지갑 연결
+                      </button>
+                    );
+                  }
+
+                  if (chain.unsupported) {
+                    return (
+                      <button
+                        className="ghost"
+                        type="button"
+                        onClick={() => {
+                          openChainModal();
+                          closeMobile();
+                        }}
+                      >
+                        네트워크 전환
+                      </button>
+                    );
+                  }
+
+                  return (
+                    <button
+                      className="ghost"
+                      type="button"
+                      onClick={() => {
+                        openAccountModal();
+                        closeMobile();
+                      }}
+                    >
+                      {shortenHash(account.address)}
+                    </button>
+                  );
+                }}
+              </ConnectButton.Custom>
+            </div>
+          </nav>
+        )}
+      </div>
+    </header>
+  );
+}
