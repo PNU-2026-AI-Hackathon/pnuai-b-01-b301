@@ -1,0 +1,118 @@
+import { NextRequest, NextResponse } from "next/server";
+import { prisma } from "@/lib/db";
+import { analyzeGrowthMonitoring } from "@/lib/growth-monitoring";
+import { cropKeyFor } from "@/lib/crop-profiles";
+import { resolveDataWindow } from "@/lib/data-window";
+import type { IoTReading } from "@/lib/iot-health";
+import { requireRole } from "@/lib/auth";
+import { guardProject } from "@/lib/operator-scope";
+import type { AppliedDecision } from "@/lib/applied-setpoints";
+
+// GET /api/monitoring/[projectId]?days=7
+// 실시간 생육 모니터링 — 시계열 판독 + 이상탐지(Z-score/CUSUM/고장게이트/최적대) +
+// 일적산 지표(DLI·GDD)와 수확 예측 합성. 웹 대시보드와 모바일 앱이 공유한다.
+export async function GET(
+  request: NextRequest,
+  { params }: { params: Promise<{ projectId: string }> }
+) {
+  // 센서 시계열 전체가 나가는 라우트다. 전에는 인증이 없어 projectId만 알면
+  // 남의 매장 데이터가 그대로 열렸다.
+  let session;
+  try {
+    session = await requireRole("operator");
+  } catch (err) {
+    if (err instanceof Response) return err;
+    throw err;
+  }
+
+  try {
+    const { projectId } = await params;
+    const denied = await guardProject(session, projectId);
+    if (denied) return denied;
+
+    const daysParam = Number(
+      request.nextUrl.searchParams.get("days") ?? "7"
+    );
+    // 1~60일로 클램프 (시드는 60일치 30분 간격 = 2,880건).
+    const days = Number.isFinite(daysParam)
+      ? Math.min(60, Math.max(1, Math.floor(daysParam)))
+      : 7;
+
+    const project = await prisma.project.findUnique({
+      where: { id: projectId },
+      select: { id: true, name: true },
+    });
+    if (!project) {
+      return NextResponse.json(
+        { error: "Project not found" },
+        { status: 404 }
+      );
+    }
+
+    // 재배 파라미터(정상범위·DLI 목표·적산온도)는 품목마다 다르다. 지점의 주력 품목
+    // = 재배중 수량이 가장 많은 품목으로 잡는다. 재배 이력이 없으면 기본 작물.
+    const lead = await prisma.inventory.findFirst({
+      where: { projectId },
+      orderBy: { growing: "desc" },
+      select: { product: { select: { name: true, category: true } } },
+    });
+    const cropKey = cropKeyFor(lead?.product.name, lead?.product.category);
+
+    // 창의 끝점은 현재가 아니라 이 지점의 센서 최신 시각이다 — 데이터가 멈춘 뒤에도
+    // 최근 N일치를 계속 판독한다.
+    const latest = await prisma.iotData.findFirst({
+      where: { projectId },
+      orderBy: { recordedAt: "desc" },
+      select: { recordedAt: true },
+    });
+    const { since, dataAsOf, stale } = resolveDataWindow(latest?.recordedAt, days);
+
+
+    // 오름차순(과거→현재) — 차트/CUSUM 인덱스가 시간순과 일치해야 한다.
+    const records = await prisma.iotData.findMany({
+      where: { projectId, recordedAt: { gte: since } },
+      orderBy: { recordedAt: "asc" },
+    });
+
+    const readings: IoTReading[] = records.map((r) => ({
+      temperature: r.temperature,
+      humidity: r.humidity,
+      co2Level: r.co2Level,
+      lightIntensity: r.lightIntensity,
+      phLevel: r.phLevel,
+    }));
+    const recordedAts = records.map((r) => r.recordedAt);
+    const growthRates = records.map((r) => r.growthRate);
+
+    // 이 매장에 적용된 설정점이 있으면 최적대와 목표 DLI가 그 값을 중심으로
+    // 좁혀진다(W1). 없으면 문헌값 그대로다. 고장 게이트는 어느 쪽이든 안 바뀐다.
+    const lastApplied = await prisma.setpointApplication.findFirst({
+      where: { projectId },
+      orderBy: { appliedAt: "desc" },
+      select: { decisions: true },
+    });
+    const appliedSetpoints = (lastApplied?.decisions ?? null) as AppliedDecision[] | null;
+
+    const analysis = analyzeGrowthMonitoring(
+      readings,
+      recordedAts,
+      growthRates,
+      cropKey,
+      appliedSetpoints
+    );
+
+    return NextResponse.json({
+      project,
+      days,
+      dataAsOf,
+      stale,
+      ...analysis,
+    });
+  } catch (error) {
+    console.error("GET /api/monitoring/[projectId] error:", error);
+    return NextResponse.json(
+      { error: "Failed to fetch monitoring data" },
+      { status: 500 }
+    );
+  }
+}

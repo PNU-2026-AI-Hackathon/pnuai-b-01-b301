@@ -1,0 +1,532 @@
+import bcrypt from "bcryptjs";
+import type { PrismaClient } from "../generated/prisma/client";
+import { buildIotRecords } from "./iot-seed";
+import { syncAgreements } from "./agreements";
+import { syncCourses } from "./operator-apply";
+import { credentialNo } from "./credential";
+
+const DAY = 24 * 60 * 60 * 1000;
+
+// ─── 마일스톤 집행 기한 (투자자 보호 — 180일 데드라인) ───
+// contracts/src/Escrow.sol의 `MILESTONE_TIMEOUT = 180 days`를 미러링한다.
+// 규칙: 기한 = 직전 마일스톤 완료시각 + 180일, 직전 완료 기록이 없으면 fundingStart 기준.
+// 시드에는 완료된 마일스톤이 없으므로 직전 단계의 기한(= 그 단계가 늦어도 끝나야 하는
+// 시각)을 앵커로 이어 붙여 단계별 상한을 만든다. 런타임에서는 트랜치가 집행될 때
+// POST /api/milestones/[id]/complete 가 다음 단계 기한을 "실제 완료시각 + 180일"로 다시 쓴다.
+// (lib/onchain.ts의 MILESTONE_TIMEOUT_DAYS와 같은 값 — 시드 CLI가 viem을 끌어오지
+//  않도록 여기서만 상수를 복제한다.)
+const MILESTONE_TIMEOUT_DAYS = 180;
+
+// 시드가 만드는 계정의 이메일 도메인. 리셋이 지우는 범위를 이것으로 가른다.
+const SEED_EMAIL_DOMAIN = "@farmfi.test";
+
+function milestoneDeadlines(fundingStart: Date, count: number): Date[] {
+  return Array.from(
+    { length: count },
+    (_, i) => new Date(fundingStart.getTime() + (i + 1) * MILESTONE_TIMEOUT_DAYS * DAY)
+  );
+}
+
+/**
+ * 데모/시연용 기준 데이터셋을 구성한다 (재실행 가능 — 기존 데이터 정리 후 재생성).
+ * `prisma/seed.ts`(CLI)와 `/api/demo/reset`(런타임)이 같은 함수를 호출해 드리프트를 막는다.
+ */
+export async function seedScenario(prisma: PrismaClient) {
+  // 리셋은 시연 데이터를 되돌리는 동작이지 가입자를 지우는 동작이 아니다.
+  // 시드가 만드는 계정은 전부 @farmfi.test 이므로, 그 밖의 계정과 그 계정에
+  // 붙은 본인확인 기록은 지우지 않고 남긴다.
+  const kept = await prisma.user.findMany({
+    where: { NOT: { email: { endsWith: SEED_EMAIL_DOMAIN } } },
+    select: { id: true },
+  });
+  const keptUserIds = kept.map((u) => u.id);
+
+  // 재실행 가능하도록 기존 데이터 정리 (FK 자식 먼저)
+  // ─── 자식 → 부모 순서로 지운다. 하나라도 빠지면 project/user deleteMany가
+  //     FK 위반으로 죽고 데모 리셋 자체가 안 된다.
+  //     새 모델을 만들면 여기에 반드시 추가한다.
+  await prisma.agreementConsent.deleteMany();
+  await prisma.milestoneReviewItem.deleteMany();
+  await prisma.operatorCredential.deleteMany();
+  await prisma.operatorContract.deleteMany();
+  await prisma.operatorCourseProgress.deleteMany();
+  await prisma.operatorVisit.deleteMany();
+  await prisma.reconciliationEntry.deleteMany();
+  await prisma.setpointApplication.deleteMany();
+  await prisma.holdingIssuance.deleteMany();
+  await prisma.custodyWallet.deleteMany();
+  await prisma.depositEvent.deleteMany();
+  await prisma.virtualAccount.deleteMany();
+  await prisma.investment.deleteMany();
+  await prisma.periodRecord.deleteMany();
+  await prisma.pickupOrder.deleteMany();
+  await prisma.subscription.deleteMany();
+  await prisma.bankAccount.deleteMany();
+  await prisma.stockAdjustment.deleteMany();
+  await prisma.deviceCommand.deleteMany();
+  await prisma.device.deleteMany();
+  await prisma.sensorThreshold.deleteMany();
+  await prisma.notificationPref.deleteMany();
+  await prisma.salesRecord.deleteMany();
+  await prisma.harvestRecord.deleteMany();
+  await prisma.inventory.deleteMany();
+  await prisma.dividendClaim.deleteMany();
+  await prisma.dividend.deleteMany();
+  await prisma.tokenHolding.deleteMany();
+  await prisma.transaction.deleteMany();
+  await prisma.notification.deleteMany();
+  await prisma.appealComment.deleteMany();
+  await prisma.appeal.deleteMany();
+  await prisma.milestone.deleteMany();
+  await prisma.payout.deleteMany();
+  await prisma.settlementRule.deleteMany();
+  await prisma.auditLog.deleteMany();
+  await prisma.navSnapshot.deleteMany();
+  await prisma.projectPartner.deleteMany();
+  await prisma.escrow.deleteMany();
+  await prisma.aiCache.deleteMany();
+  await prisma.demoCache.deleteMany();
+  await prisma.identityVerification.deleteMany({
+    where: { OR: [{ userId: null }, { userId: { notIn: keptUserIds } }] },
+  });
+  await prisma.iotData.deleteMany();
+  await prisma.product.deleteMany();
+  await prisma.project.deleteMany();
+  await prisma.institution.deleteMany();
+  await prisma.operatorApplication.deleteMany();
+  await prisma.space.deleteMany();
+  await prisma.user.deleteMany({ where: { email: { endsWith: SEED_EMAIL_DOMAIN } } });
+
+  // 동의 문서와 교육 과정은 시나리오 데이터가 아니라 기준 데이터다.
+  // 지우지 않고 코드에 맞춘다.
+  await syncAgreements(prisma);
+  await syncCourses(prisma);
+
+  const now = new Date();
+  const pw = await bcrypt.hash("farmfi123", 10);
+
+  // ─── 사용자 (비밀번호 farmfi123) ───
+  const admin = await prisma.user.create({
+    data: { name: "관리자", role: "admin", email: "admin@farmfi.test", passwordHash: pw },
+  });
+  const operator = await prisma.user.create({
+    data: { name: "정하은", role: "operator", email: "operator@farmfi.test", passwordHash: pw },
+  });
+  const landlord = await prisma.user.create({
+    data: { name: "최영호", role: "landlord", email: "landlord@farmfi.test", passwordHash: pw },
+  });
+  // 설비업체는 조성자금을 직접 받는 수취인이다. 마일스톤이 집행될 때
+  // POST /api/milestones/[id]/complete 가 이 계정 앞으로 지급 건을 만든다.
+  // 계정이 있어야 지급 실행(POST /api/payouts/[id]/execute)이 계좌를 찾을 수 있다.
+  const vendor = await prisma.user.create({
+    data: { name: "그린셀 스마트팜", role: "vendor", email: "vendor@farmfi.test", passwordHash: pw },
+  });
+  // 투자자 3명 — 본인인증 완료·연간한도 20M (청약 데모 대상)
+  const verifiedInvestor = (name: string, email: string) => ({
+    name, role: "investor", email, passwordHash: pw,
+    balance: BigInt(5_000_000),
+    identityVerified: true, verifiedAt: now, realName: name,
+    investorAnnualLimit: BigInt(20_000_000),
+  });
+  // 시연 계정 — 본인확인 화면부터 흐름 전체를 보여주려고 일부러 미인증으로 둔다.
+  // DEMO_ACCOUNTS 에 등록돼 있어 신분증 제출 없이 그 자리를 통과한다.
+  await prisma.user.create({
+    data: {
+      name: "시연", role: "investor", email: "demo@farmfi.test", passwordHash: pw,
+      balance: BigInt(5_000_000),
+      investorAnnualLimit: BigInt(20_000_000),
+    },
+  });
+  const investor1 = await prisma.user.create({ data: verifiedInvestor("김투자", "investor@farmfi.test") });
+  const investor2 = await prisma.user.create({ data: verifiedInvestor("이서연", "investor2@farmfi.test") });
+  const investor3 = await prisma.user.create({ data: verifiedInvestor("박준혁", "investor3@farmfi.test") });
+
+  // ─── 운영자 신청 (O-03~O-07 완료 상태) ───
+  // 보증서는 계약이 끝난 신청에서 나온다(O-08). 신청이 없으면 발급할 근거가 없어
+  // 보증서 흐름 전체를 시연할 수 없다.
+  const operatorApplication = await prisma.operatorApplication.create({
+    data: {
+      userId: operator.id,
+      region: "부산 금정구",
+      cropExperience: "가정 수경재배 2년",
+      availableHours: "주 5일 · 하루 4시간",
+      status: "approved",
+      educationProgress: 100,
+      educationDoneAt: now,
+      visitAt: new Date(now.getTime() - 21 * DAY),
+      visitDoneAt: new Date(now.getTime() - 21 * DAY),
+      confirmedAt: new Date(now.getTime() - 14 * DAY),
+      contractSignedAt: new Date(now.getTime() - 7 * DAY),
+      documents: ["/assets/figma/evidence-1.jpg", "/assets/figma/evidence-2.jpg"],
+    },
+  });
+
+  // 계약이 없으면 O-07이 "공간 확정하러 가기" 빈 화면에 멈춘다.
+  await prisma.operatorContract.create({
+    data: {
+      applicationId: operatorApplication.id,
+      body: [
+        "제1조 (목적) 이 계약은 FarmFi가 배정한 매장에서 운영자가 스마트팜을 운영하는 조건을 정한다.",
+        "제2조 (운영 기간) 운영 기간은 계약 시작일로부터 12개월로 하고, 종료 60일 전까지 갱신 여부를 통지한다.",
+        "제3조 (정산) 매출에서 운영비를 먼저 반영하고, 남은 배분 가능액을 정산 규칙에 따라 나눈다.",
+        "제4조 (중도 해지) 어느 쪽이든 30일 전 통지와 인수인계로 해지할 수 있다.",
+      ].join("\n\n"),
+      contentHash: "seedcontract0001",
+      status: "SIGNED",
+      signature: "정하은",
+      signedAt: new Date(now.getTime() - 7 * DAY),
+      termStart: new Date(now.getTime() - 7 * DAY),
+      termEnd: new Date(now.getTime() + 358 * DAY),
+    },
+  });
+
+  // ─── 회수 계좌 (C-I03에서 확인한 본인 명의 계좌) ───
+  // 없으면 지급 어댑터가 이체를 거부한다 — 실제로 그게 맞는 동작이지만,
+  // 시연에서 모든 지급이 "계좌 없음"으로 실패하면 정산 흐름을 보여줄 수 없다.
+  // 계좌번호 원문은 저장하지 않는다. 표시용 마스킹과 지급사 토큰만 둔다.
+  const bankFor = (u: { id: string; name: string }, bankName: string, tail: string) => ({
+    userId: u.id,
+    bankName,
+    maskedNumber: `123-****-${tail}`,
+    accountToken: `seed_token_${u.id}`,
+    holderName: u.name,
+    verifiedAt: now,
+  });
+  await prisma.bankAccount.createMany({
+    data: [
+      bankFor(investor1, "부산은행", "1001"),
+      bankFor(investor2, "국민은행", "1002"),
+      bankFor(investor3, "신한은행", "1003"),
+      bankFor(operator, "농협은행", "2001"),
+      bankFor(landlord, "우리은행", "3001"),
+      bankFor(vendor, "기업은행", "4001"),
+    ],
+  });
+
+  // ─── 공간 ───
+  await prisma.space.create({
+    data: {
+      ownerId: landlord.id,
+      spaceType: "vacant_store",
+      address: "부산 동래구 온천장로 12",
+      area: "50~100평",
+      electricity: "가능",
+      water: "가능",
+      lighting: "좋음",
+      preferredMode: "임대형",
+      suitabilityScore: 88,
+      estimatedRent: 1_200_000,
+      status: "approved",
+    },
+  });
+
+  // ─── 도입 기관 ───
+  const institution = await prisma.institution.create({
+    data: { name: "부산진구 도시재생지원센터", type: "public", contactName: "김담당", contactEmail: "cs@bjgu.go.kr" },
+  });
+
+  // ─── 품목 (v18 엽채류·허브, 프리미엄 소포장 3,000~4,000원/봉) ───
+  const sangchu = await prisma.product.create({ data: { name: "상추", category: "leafy", unitPrice: 3000, growDays: 28 } });
+  const rucola = await prisma.product.create({ data: { name: "루꼴라", category: "leafy", unitPrice: 3500, growDays: 30 } });
+  const basil = await prisma.product.create({ data: { name: "바질", category: "herb", unitPrice: 4000, growDays: 35 } });
+  // 방울토마토는 뺐다. 앱 스프라이트(tomato)와 토마토 베드 아트는 코드에 남아 있어
+  // 품목을 다시 넣으면 그대로 살아난다 — cropKindOf()가 이름 "토마토"로 매핑한다.
+  const products = [sangchu, rucola, basil];
+  // 지점마다 내주는 작물이 다르다는 걸 보여주는 두 품목. 베드 A·B·C(설비·수확 실적)는
+  // 위 세 품목이 그대로 쓰고, 이 둘은 진열 재고로만 존재한다.
+  const kale = await prisma.product.create({ data: { name: "케일", category: "leafy", unitPrice: 3500, growDays: 32 } });
+  const mint = await prisma.product.create({ data: { name: "민트", category: "herb", unitPrice: 4000, growDays: 30 } });
+
+  // ─── 지점 2곳 (기관 소속) ───
+  // 1호점은 이미 모집이 끝난(funded) 라운드라 청약 기간을 과거로 둔다. 이 fundingStart가
+  // 마일스톤 1의 기한 앵커가 되어 D-120(= 60일 전 + 180일)으로 잡힌다.
+  const p1FundingStart = new Date(now.getTime() - 60 * DAY);
+  const p1Deadlines = milestoneDeadlines(p1FundingStart, 5);
+  const p1 = await prisma.project.create({
+    data: {
+      name: "온천장 스마트팜 1호점", location: "부산 동래구", buildingType: "vacant_store", areaSqm: 83,
+      esgTag: "공실 재생", targetReturnPct: 115, paybackMonths: 15,
+      status: "funded", institutionId: institution.id, operatorId: operator.id,
+      // STO 라운드 완료 — 기획 v16 §3: 사이트당 4,400만(설비 4,000만 + 온보딩피 400만),
+      // 1구좌 1만원 → 4,400구좌. contracts/script/Deploy.s.sol의 FarmToken 총발행 4400과 동일.
+      tokenSymbol: "MF01", tokenPrice: BigInt(10_000), totalTokens: 4400, soldTokens: 4400,
+      targetAmount: BigInt(44_000_000), currentAmount: BigInt(44_000_000), totalCapex: BigInt(44_000_000),
+      fundingStart: p1FundingStart, fundingEnd: new Date(now.getTime() - 30 * DAY),
+      contractAddress: process.env.NEXT_PUBLIC_ESCROW_ADDRESS || "0x64192509ed43efdb070805e1479974d259201b75",
+    },
+  });
+  const p2 = await prisma.project.create({
+    data: {
+      name: "장전동 스마트팜 2호점", location: "부산 금정구", buildingType: "vacant_store", areaSqm: 66,
+      esgTag: "로컬 유통", targetReturnPct: 112, paybackMonths: 18,
+      status: "operating", institutionId: institution.id, operatorId: operator.id,
+    },
+  });
+  const projects = [p1, p2];
+
+  for (const proj of projects) {
+    // 재고-생육: '오늘 할 일'이 나오도록 — 상추=수확 임박+재고부족, 바질=오늘 수확,
+    // 루꼴라=여유
+    // 케일·민트는 1호점만 진열한다. 2호점은 재배 중이라 아직 못 고른다 —
+    // 정기구독 팩 크기(3·5·7종)가 지점 사정에 따라 잠기는 걸 보여주는 값이다.
+    const stocked = proj.id === p1.id;
+    await prisma.inventory.createMany({
+      data: [
+        { projectId: proj.id, productId: sangchu.id, inStock: 4, growing: 120, plantedAt: new Date(now.getTime() - 27 * DAY), expectedHarvestAt: new Date(now.getTime() - 1 * DAY) },
+        { projectId: proj.id, productId: rucola.id, inStock: 22, growing: 80, plantedAt: new Date(now.getTime() - 10 * DAY), expectedHarvestAt: new Date(now.getTime() + 12 * DAY) },
+        { projectId: proj.id, productId: basil.id, inStock: 3, growing: 60, plantedAt: new Date(now.getTime() - 35 * DAY), expectedHarvestAt: now },
+        { projectId: proj.id, productId: kale.id, inStock: stocked ? 15 : 0, growing: 90, plantedAt: new Date(now.getTime() - 20 * DAY), expectedHarvestAt: new Date(now.getTime() + 6 * DAY) },
+        { projectId: proj.id, productId: mint.id, inStock: stocked ? 9 : 0, growing: 45, plantedAt: new Date(now.getTime() - 15 * DAY), expectedHarvestAt: new Date(now.getTime() + 9 * DAY) },
+      ],
+    });
+
+    // ─── 설비 (베드별 LED·순환팬·관수 펌프) ───
+    // 베드는 품목 수만큼 생긴다 — 위 재고 3품목이 곧 베드 A·B·C다. 앱 모니터링 화면이
+    // 이 행을 읽어 토글하고, 그 결과가 DeviceCommand로 남는다. 시드가 없으면 제어 화면이
+    // 빈 목록이 된다.
+    await prisma.device.createMany({
+      data: ["A", "B", "C"].flatMap((bed) => [
+        { projectId: proj.id, bed, kind: "led", name: "LED 조명", isOn: true },
+        { projectId: proj.id, bed, kind: "fan", name: "순환팬", isOn: true },
+        { projectId: proj.id, bed, kind: "pump", name: "관수 펌프", isOn: false },
+      ]),
+    });
+
+    // 수확·판매 실적 14일치 (판매-재배 추이 + 기관 리포트 집계용)
+    const harvests: { projectId: string; productId: string; quantity: number; harvestedAt: Date }[] = [];
+    const sales: { projectId: string; productId: string; quantity: number; amount: number; soldAt: Date }[] = [];
+    for (let d = 14; d >= 1; d--) {
+      const day = new Date(now.getTime() - d * DAY);
+      for (const prod of products) {
+        const qtyH = 30 + Math.floor(Math.random() * 20);
+        harvests.push({ projectId: proj.id, productId: prod.id, quantity: qtyH, harvestedAt: day });
+        const qtyS = 25 + Math.floor(Math.random() * 15);
+        sales.push({ projectId: proj.id, productId: prod.id, quantity: qtyS, amount: qtyS * prod.unitPrice, soldAt: day });
+      }
+    }
+    await prisma.harvestRecord.createMany({ data: harvests });
+    await prisma.salesRecord.createMany({ data: sales });
+
+    // IoT 60일치 (생육 모니터링·이상감지)
+    // 1호점은 관행 점등 + 고장 시나리오(냉방 저하·펌프 막힘·LED 열화)를 담아 탐지기가
+    // 실제로 발화하는 계열을, 2호점은 TOU 최적 점등 + 무고장 계열을 갖는다. 두 지점을
+    // 나란히 보면 "심야 점등은 정상, 순간 조도가 아니라 일적산으로 판정한다"가 드러난다.
+    const isPilot = proj.id === p1.id;
+    await prisma.iotData.createMany({
+      data: buildIotRecords(proj.id, now, {
+        cropKey: "leafy",
+        schedule: isPilot ? "conventional" : "tou-optimized",
+        scenario: isPilot,
+      }),
+    });
+  }
+
+  // ─── STO: 1호점 에스크로·마일스톤5·파트너·투자 (청약·배당·검증 데모) ───
+  await prisma.escrow.create({
+    data: {
+      projectId: p1.id,
+      // 완판 4,400만 전액 락업 · 마일스톤1이 아직 in_progress라 집행액 0 → 잔액 = 락업액.
+      totalLocked: BigInt(44_000_000), totalReleased: BigInt(0), remaining: BigInt(44_000_000),
+      status: "active",
+      contractAddress: process.env.NEXT_PUBLIC_ESCROW_ADDRESS || "0x64192509ed43efdb070805e1479974d259201b75",
+    },
+  });
+  // 트랜치 = 목표조달 4,400만 × releasePct (10/20/30/25/15)
+  //        → 440/880/1,320/1,100/660만, 합계 4,400만.
+  // 비율은 리스크가 실제로 옮겨가는 시점을 따른다 — 계약 단계는 낮게 잡아 투자자 노출을
+  // 줄이고, 하드웨어가 현장에 들어오는 반입 시점(누적 60%)에 대금을 크게 실어 설비업체의
+  // 외상 구간을 좁힌다. 마지막 15%는 실제 개점을 확인하는 유보금이다.
+  //
+  // assetValue는 그 단계에서 실물로 생긴 자산이다. NAV = (에스크로 잔액 + 완료분 자산)
+  // / 4,400좌 이므로(lib/nav-calculator) 아래 값이면 기준가가 이렇게 움직인다.
+  //   M1 10,000 → M2 10,500 → M3 11,500 → M4 12,500 → M5 13,000 원/좌
+  // 발행가 1만원 대비 M4에서 +25% — 검증 데모의 NAV 상승 연출이 여기에 온다.
+  // deadlineAt: 1단계는 D-120(진행 중 단계의 실제 카운트다운), 이후 단계는 180일씩 뒤로.
+  await prisma.milestone.createMany({
+    data: [
+      { projectId: p1.id, seq: 1, name: "계약 체결", description: "공간사용 협약 체결", releasePct: 1000, releaseAmount: BigInt(4_400_000), status: "in_progress", conditionText: "공간사용 협약서·임대계약서 제출", requiredSignals: ["contract"], iotMinDays: 0, assetValue: BigInt(4_400_000), deadlineAt: p1Deadlines[0] },
+      { projectId: p1.id, seq: 2, name: "설비 발주·제작", description: "스마트팜 유닛 발주 및 제작 착수", releasePct: 2000, releaseAmount: BigInt(8_800_000), status: "pending", conditionText: "설비 발주서·계약금 영수증", requiredSignals: ["contract", "receipt"], iotMinDays: 0, crossCheck: "contract↔receipt", assetValue: BigInt(11_000_000), deadlineAt: p1Deadlines[1] },
+      { projectId: p1.id, seq: 3, name: "반입·설치 착수", description: "설비 현장 반입 및 설치 착수", releasePct: 3000, releaseAmount: BigInt(13_200_000), status: "pending", conditionText: "반입 현장 사진·운송 영수증", requiredSignals: ["photo", "receipt"], iotMinDays: 0, crossCheck: "receipt↔photo", assetValue: BigInt(17_600_000), deadlineAt: p1Deadlines[2] },
+      { projectId: p1.id, seq: 4, name: "설치 완료·검수", description: "설치 완료 및 검수 확인", releasePct: 2500, releaseAmount: BigInt(11_000_000), status: "pending", conditionText: "설치 완료 사진·검수확인서", requiredSignals: ["photo", "inspection"], iotMinDays: 0, crossCheck: "photo↔inspection", assetValue: BigInt(15_400_000), deadlineAt: p1Deadlines[3] },
+      { projectId: p1.id, seq: 5, name: "시운전·영업 개시", description: "시운전 가동률 확인 및 영업 개시", releasePct: 1500, releaseAmount: BigInt(6_600_000), status: "pending", conditionText: "IoT 14일 가동률 90% 이상·첫 판매 영수증", requiredSignals: ["iot", "receipt"], iotMinDays: 14, assetValue: BigInt(8_800_000), deadlineAt: p1Deadlines[4] },
+    ],
+  });
+  await prisma.projectPartner.create({
+    data: { projectId: p1.id, role: "landlord", name: "최영호", userId: landlord.id, monthlyRecoveryAmount: BigInt(500_000) },
+  });
+  await prisma.projectPartner.create({
+    data: { projectId: p1.id, role: "equipment_partner", name: "그린셀 스마트팜", userId: vendor.id },
+  });
+  await prisma.tokenHolding.create({
+    data: { userId: investor1.id, projectId: p1.id, amount: 50, avgPrice: BigInt(10_000) },
+  });
+  await prisma.transaction.create({
+    data: { projectId: p1.id, userId: investor1.id, type: "subscription", amount: BigInt(500_000), tokenAmount: 50, memo: "청약 (시드)" },
+  });
+
+  // ─── STO: 3호점 모집중(funding) — 청약·검증·배당 데모 대상 (에스크로·마일스톤 pending) ───
+  const p3 = await prisma.project.create({
+    data: {
+      name: "명륜동 스마트팜 3호점",
+      description: "부산 동래구 명륜동 공실 상가 전환 라운드 (모집 중).",
+      location: "부산 동래구 명륜동", buildingType: "vacant_store", areaSqm: 76,
+      esgTag: "에너지 절감", targetReturnPct: 115, paybackMonths: 15,
+      status: "funding", institutionId: institution.id, operatorId: operator.id,
+      // 1호점과 같은 표준 유닛 — 4,400구좌/4,400만. 모집 진행률 79%(3,480구좌 = 3,480만).
+      // 잔여 920구좌 = 데모 스텝 1~3(300+200+420)이 채우는 양 → 스텝 3에서 정확히 완납(funded)되고
+      // escrow가 4,400만이 되어 트랜치 4개(1,540+1,320+880+660만 = 4,400만)를 전부 집행할 수 있다.
+      tokenSymbol: "MF03", tokenPrice: BigInt(10_000), totalTokens: 4400, soldTokens: 3480,
+      targetAmount: BigInt(44_000_000), currentAmount: BigInt(34_800_000), totalCapex: BigInt(44_000_000),
+      fundingStart: now, fundingEnd: new Date(now.getTime() + 30 * DAY),
+      contractAddress: process.env.NEXT_PUBLIC_ESCROW_ADDRESS || "0x64192509ed43efdb070805e1479974d259201b75",
+    },
+  });
+  await prisma.escrow.create({
+    data: {
+      projectId: p3.id,
+      // 모집 중이므로 락업액 = 현재까지 청약된 3,480만(= currentAmount), 집행 0.
+      totalLocked: BigInt(34_800_000), totalReleased: BigInt(0), remaining: BigInt(34_800_000),
+      status: "active",
+      contractAddress: process.env.NEXT_PUBLIC_ESCROW_ADDRESS || "0x64192509ed43efdb070805e1479974d259201b75",
+    },
+  });
+  // 1호점과 동일한 표준 트랜치 — 목표 4,400만 기준 1,540/1,320/880/660만(합계 4,400만).
+  // 3호점은 아직 모집 중이라 기한 앵커가 fundingStart(오늘) → 1단계 D-180.
+  const p3Deadlines = milestoneDeadlines(now, 5);
+  await prisma.milestone.createMany({
+    data: [
+      { projectId: p3.id, seq: 1, name: "계약 체결", description: "공간사용 협약 체결", releasePct: 1000, releaseAmount: BigInt(4_400_000), status: "pending", conditionText: "공간사용 협약서·임대계약서 제출", requiredSignals: ["contract"], iotMinDays: 0, assetValue: BigInt(4_400_000), deadlineAt: p3Deadlines[0] },
+      { projectId: p3.id, seq: 2, name: "설비 발주·제작", description: "스마트팜 유닛 발주 및 제작 착수", releasePct: 2000, releaseAmount: BigInt(8_800_000), status: "pending", conditionText: "설비 발주서·계약금 영수증", requiredSignals: ["contract", "receipt"], iotMinDays: 0, crossCheck: "contract↔receipt", assetValue: BigInt(11_000_000), deadlineAt: p3Deadlines[1] },
+      { projectId: p3.id, seq: 3, name: "반입·설치 착수", description: "설비 현장 반입 및 설치 착수", releasePct: 3000, releaseAmount: BigInt(13_200_000), status: "pending", conditionText: "반입 현장 사진·운송 영수증", requiredSignals: ["photo", "receipt"], iotMinDays: 0, crossCheck: "receipt↔photo", assetValue: BigInt(17_600_000), deadlineAt: p3Deadlines[2] },
+      { projectId: p3.id, seq: 4, name: "설치 완료·검수", description: "설치 완료 및 검수 확인", releasePct: 2500, releaseAmount: BigInt(11_000_000), status: "pending", conditionText: "설치 완료 사진·검수확인서", requiredSignals: ["photo", "inspection"], iotMinDays: 0, crossCheck: "photo↔inspection", assetValue: BigInt(15_400_000), deadlineAt: p3Deadlines[3] },
+      { projectId: p3.id, seq: 5, name: "시운전·영업 개시", description: "시운전 가동률 확인 및 영업 개시", releasePct: 1500, releaseAmount: BigInt(6_600_000), status: "pending", conditionText: "IoT 14일 가동률 90% 이상·첫 판매 영수증", requiredSignals: ["iot", "receipt"], iotMinDays: 14, assetValue: BigInt(8_800_000), deadlineAt: p3Deadlines[4] },
+    ],
+  });
+  await prisma.projectPartner.create({
+    data: { projectId: p3.id, role: "landlord", name: "박건물", monthlyRecoveryAmount: BigInt(450_000) },
+  });
+  await prisma.projectPartner.create({
+    data: { projectId: p3.id, role: "equipment_partner", name: "그린셀 스마트팜", userId: vendor.id },
+  });
+  // 기청약 3,480구좌의 보유 내역 — soldTokens와 반드시 합이 같아야 한다.
+  // 배당(POST /api/dividends/distribute)의 perToken 분모가 soldTokens가 아니라 TokenHolding
+  // 합계라서, 이 행이 없으면 데모 청약분(920구좌)만 분모가 되어 1좌당 배당이 과대 계상된다.
+  // 데모 스텝 1~3이 같은 3명으로 추가 청약(300·200·420)해도 연간한도 2,000만을 넘지 않는다
+  // (김투자 1호점 50좌 포함 1,550만 · 이서연 1,280만 · 박준혁 1,620만).
+  const p3Seeded: [string, number][] = [
+    [investor1.id, 1200],
+    [investor2.id, 1080],
+    [investor3.id, 1200],
+  ];
+  await prisma.tokenHolding.createMany({
+    data: p3Seeded.map(([userId, amount]) => ({
+      userId, projectId: p3.id, amount, avgPrice: BigInt(10_000),
+    })),
+  });
+  await prisma.transaction.createMany({
+    data: p3Seeded.map(([userId, amount]) => ({
+      projectId: p3.id, userId, type: "subscription",
+      amount: BigInt(amount) * BigInt(10_000), tokenAmount: amount, memo: "청약 (시드)",
+    })),
+  });
+  // IoT 60일치 — 시운전·지속운영 마일스톤(가동률 게이트) 검증용. 게이트를 재는 지점이라
+  // 고장 시나리오는 넣지 않는다.
+  await prisma.iotData.createMany({
+    data: buildIotRecords(p3.id, now, { cropKey: "leafy", scenario: false }),
+  });
+
+  // ─── 생육 이상 알림 ───
+  // 1호점 IoT 계열에 심은 세 고장에 각각 대응한다. 탐지 경로가 다르다는 것이 요점 —
+  // 스파이크는 Z-score, 지속 드리프트는 CUSUM, 광량 열화는 일적산(DLI)만이 잡는다.
+  await prisma.notification.createMany({
+    data: [
+      {
+        projectId: p1.id,
+        type: "drift_temperature",
+        message: "온도 지속 드리프트 · CUSUM 4.1σ — 냉방 성능 저하 예지보전 점검 권고",
+      },
+      {
+        projectId: p1.id,
+        type: "range_violation",
+        message: "설비 이상 의심 · 양액 pH 4.2pH (정상 5~7) — 현장 점검이 필요합니다",
+      },
+      {
+        projectId: p1.id,
+        type: "dli_shortfall",
+        message: "일적산광량 미달 · 목표의 78% — LED 광량 열화 의심",
+      },
+    ],
+  });
+
+  // 보증서까지 발급해 둔다 — O-08과 A-03이 빈 화면으로만 보이지 않게.
+  await prisma.operatorCredential.create({
+    data: {
+      credentialNo: credentialNo(operatorApplication.id, now),
+      userId: operator.id,
+      applicationId: operatorApplication.id,
+      projectId: p2.id,
+      status: "active",
+      issuedAt: new Date(now.getTime() - 7 * DAY),
+      expiresAt: new Date(now.getTime() + 358 * DAY),
+    },
+  });
+
+  // ─── 보완 요청과 이의제기 (O-10 · O-11 · O-11E · A-08 · A-09) ───
+  // 이 두 줄이 없으면 분쟁 화면들이 전부 빈 상태로만 보여, 무엇을 만들었는지
+  // 화면에서 확인할 수가 없다.
+  const p1Step1 = await prisma.milestone.findFirstOrThrow({
+    where: { projectId: p1.id, seq: 1 },
+  });
+  await prisma.milestone.update({
+    where: { id: p1Step1.id },
+    data: {
+      status: "revision_required",
+      evidenceUrls: ["/assets/figma/evidence-1.jpg", "/assets/figma/evidence-2.jpg"],
+      evidenceSubmittedAt: new Date(now.getTime() - 2 * DAY),
+      reviewNote:
+        "영수증 금액이 계약서와 다릅니다. 변경합의서가 있다면 함께 올려주세요.",
+      reviewedAt: new Date(now.getTime() - DAY),
+    },
+  });
+  await prisma.milestoneReviewItem.createMany({
+    data: [
+      { milestoneId: p1Step1.id, signal: "contract", verdict: "met", note: "공간사용 협약서 확인", autoDraft: false },
+      { milestoneId: p1Step1.id, signal: "receipt", verdict: "unmet", note: "계약서 금액과 불일치", autoDraft: false },
+      { milestoneId: p1Step1.id, signal: "photo", verdict: "met", note: "현장 사진 2장", autoDraft: false },
+    ],
+  });
+
+  const appeal = await prisma.appeal.create({
+    data: {
+      milestoneId: p1Step1.id,
+      projectId: p1.id,
+      submittedById: operator.id,
+      reason:
+        "변경합의서를 첨부합니다. 설비 사양 변경으로 금액이 조정된 건이라 계약서와 영수증 금액이 다릅니다.",
+      status: "under_review",
+    },
+  });
+  await prisma.appealComment.createMany({
+    data: [
+      {
+        appealId: appeal.id,
+        authorId: operator.id,
+        authorRole: "operator",
+        body: "변경합의서를 올렸습니다. 확인 부탁드립니다.",
+      },
+      {
+        appealId: appeal.id,
+        authorId: admin.id,
+        authorRole: "admin",
+        body: "합의서는 확인했습니다. LED 점등 사진이 흐려 판독되지 않으니 재촬영본을 올려주세요.",
+      },
+    ],
+  });
+
+  return {
+    projects: projects.length + 1,
+    products: products.length,
+    operator: operator.name,
+    investors: [investor1.name, investor2.name, investor3.name],
+  };
+}

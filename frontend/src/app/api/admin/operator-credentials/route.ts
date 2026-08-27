@@ -1,0 +1,161 @@
+import { requestIssueOffer } from "@/lib/identity/opendid-issuer";
+import { NextRequest, NextResponse } from "next/server";
+import { prisma } from "@/lib/db";
+import { requireRole } from "@/lib/auth";
+import { recordAudit } from "@/lib/audit";
+import {
+  CREDENTIAL_STATUS_LABEL,
+  SUSPEND_REASONS,
+  checkCredential,
+  credentialNo,
+} from "@/lib/credential";
+
+// GET /api/admin/operator-credentials — 발급 현황 (A-03)
+export async function GET() {
+  try {
+    await requireRole("admin");
+  } catch (err) {
+    if (err instanceof Response) return err;
+    throw err;
+  }
+
+  // 발급 대기 = 계약까지 끝났는데 아직 보증서가 없는 신청. 이 목록이 없으면
+  // A-03에서 발급할 대상을 고를 수가 없다.
+  const [rows, pending] = await Promise.all([
+    prisma.operatorCredential.findMany({
+      orderBy: { issuedAt: "desc" },
+      take: 100,
+      include: {
+        user: { select: { id: true, name: true, email: true } },
+        application: { select: { id: true, region: true } },
+        project: { select: { id: true, name: true } },
+      },
+    }),
+    prisma.operatorApplication.findMany({
+      where: { contractSignedAt: { not: null }, certificateNo: null },
+      orderBy: { contractSignedAt: "asc" },
+      select: {
+        id: true,
+        region: true,
+        contractSignedAt: true,
+        user: { select: { id: true, name: true } },
+        contract: { select: { termEnd: true } },
+      },
+    }),
+  ]);
+
+  return NextResponse.json({
+    credentials: rows.map((c) => ({
+      id: c.id,
+      credentialNo: c.credentialNo,
+      user: c.user,
+      application: c.application,
+      project: c.project,
+      status: c.status,
+      statusLabel: CREDENTIAL_STATUS_LABEL[c.status] ?? c.status,
+      statusReason: c.statusReason,
+      statusNote: c.statusNote,
+      issuedAt: c.issuedAt,
+      expiresAt: c.expiresAt,
+      // 저장된 status가 active여도 기간이 지났으면 실제로는 만료다.
+      effective: checkCredential(c),
+    })),
+    pending: pending.map((a) => ({
+      id: a.id,
+      region: a.region,
+      user: a.user,
+      contractSignedAt: a.contractSignedAt,
+      termEnd: a.contract?.termEnd ?? null,
+    })),
+    suspendReasons: SUSPEND_REASONS,
+  });
+}
+
+/**
+ * POST /api/admin/operator-credentials — 발급 (A-03).
+ * body: { applicationId, projectId?, months? }
+ *
+ * 명세 17.1-8: 유효기간은 지점 운영계약 기간과 연동한다. 계약 종료일을 모르면
+ * 기본 12개월로 두되, 그 값이 계약과 다르면 관리자가 고쳐야 한다.
+ */
+export async function POST(request: NextRequest) {
+  let session;
+  try {
+    session = await requireRole("admin");
+  } catch (err) {
+    if (err instanceof Response) return err;
+    throw err;
+  }
+
+  let body: unknown;
+  try {
+    body = await request.json();
+  } catch {
+    return NextResponse.json({ error: "Invalid request body" }, { status: 400 });
+  }
+  const { applicationId, projectId, months } = (body ?? {}) as Record<string, unknown>;
+
+  if (typeof applicationId !== "string" || !applicationId) {
+    return NextResponse.json({ error: "applicationId가 필요합니다." }, { status: 400 });
+  }
+
+  const application = await prisma.operatorApplication.findUnique({
+    where: { id: applicationId },
+    include: { user: { select: { id: true, name: true } } },
+  });
+  if (!application) {
+    return NextResponse.json({ error: "신청을 찾을 수 없습니다." }, { status: 404 });
+  }
+
+  // 유효한 보증서가 이미 있으면 두 장이 생긴다. 재발급은 기존 것을 해지한 뒤에 한다.
+  const existing = await prisma.operatorCredential.findFirst({
+    where: { userId: application.userId, status: { in: ["active", "suspended"] } },
+  });
+  if (existing) {
+    return NextResponse.json(
+      {
+        error: `이미 발급된 보증서가 있습니다 (${existing.credentialNo}). 재발급하려면 기존 보증서를 먼저 해지해 주세요.`,
+      },
+      { status: 409 },
+    );
+  }
+
+  const span = typeof months === "number" && months > 0 ? Math.floor(months) : 12;
+  const expiresAt = new Date();
+  expiresAt.setMonth(expiresAt.getMonth() + span);
+
+  // Open DID Issuer에서 발급 오퍼를 받아 둔다 (라온시큐어 피드백 — 보증서 발급에
+  // Open DID를 쓴다). 실패해도 발급을 막지 않는다: 번호 기반 검증이 이미 성립하고,
+  // Issuer가 죽었다고 운영자가 매장에 못 들어가는 건 과한 결합이다.
+  //
+  // 오퍼는 VC가 아니다. 운영자가 DID 지갑으로 수령해야 VC가 생기므로 vcId는
+  // 계속 null이고, 화면은 "번호로 검증"을 그대로 표시한다.
+  const offer = await requestIssueOffer();
+
+  const created = await prisma.operatorCredential.create({
+    data: {
+      credentialNo: credentialNo(applicationId),
+      userId: application.userId,
+      applicationId,
+      spaceId: application.spaceId ?? null,
+      projectId: typeof projectId === "string" && projectId ? projectId : null,
+      status: "active",
+      expiresAt,
+      vcOfferId: offer?.offerId ?? null,
+      vcPlanId: offer?.vcPlanId ?? null,
+      vcOfferAt: offer ? new Date() : null,
+    },
+  });
+
+  await recordAudit({
+    actorId: session.userId,
+    actorRole: "admin",
+    action: "credential.issued",
+    entityType: "user",
+    entityId: application.userId,
+    summary: `${application.user.name} 운영자 보증서 발급 · ${created.credentialNo} (${span}개월)`,
+    detail: { credentialNo: created.credentialNo, expiresAt: created.expiresAt.toISOString() },
+  });
+
+  return NextResponse.json({ credential: created });
+}
